@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.26...3.29)
-project(${SKBUILD_PROJECT_NAME} LANGUAGES C VERSION ${SKBUILD_PROJECT_VERSION})
+project(${SKBUILD_PROJECT_NAME} VERSION ${SKBUILD_PROJECT_VERSION}
+	LANGUAGES C )
 
 find_package(
   Python
@@ -7,7 +8,7 @@ find_package(
   COMPONENTS
   Interpreter
   Development.Module
-  ${SKBUILD_SABI_COMPONENT}
+  Development.SABIModule
   NumPy
   )
   

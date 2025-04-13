@@ -23,6 +23,7 @@ from ..ui.main_window import Ui_PyMDFMainWindow
 from ..utils import draw_color_icon
 from .batch import BatchWidget
 from .file import FileWidget
+from .live_stream import LiveStreamWidget
 from .mdi_area import MdiAreaWidget, WithMDIArea
 from .plot import Plot
 
@@ -101,6 +102,12 @@ class MainWindow(WithMDIArea, Ui_PyMDFMainWindow, QtWidgets.QMainWindow):
         action = QtGui.QAction(icon, "Open folder", menu)
         action.triggered.connect(self.open_folder)
         open_group.addAction(action)
+
+        action = QtGui.QAction(icon, "Live stream", menu)
+        action.triggered.connect(self.live_stream)
+        # action.setShortcut(QtGui.QKeySequence("Ctrl+L"))
+        open_group.addAction(action)
+        # print(menu.actions())
 
         menu.addActions(open_group.actions())
 
@@ -1270,6 +1277,10 @@ class MainWindow(WithMDIArea, Ui_PyMDFMainWindow, QtWidgets.QMainWindow):
             self.stackedWidget.setCurrentIndex(0)
         else:
             self.open_batch_files(event)
+    def live_stream(self, event):
+        if self.stackedWidget.currentIndex() in (0, 2):
+            self.stream(event)
+            self.stackedWidget.setCurrentIndex(0)
 
     def _open_file(self, file_name):
         if isinstance(file_name, tuple | list):
@@ -1308,6 +1319,34 @@ class MainWindow(WithMDIArea, Ui_PyMDFMainWindow, QtWidgets.QMainWindow):
 
                 self.edit_cursor_options()
 
+    def _open_stream(self, file_name):
+        try:
+            widget = LiveStreamWidget(
+                file_name,
+                self.with_dots,
+                self.subplots,
+                self.subplots_link,
+                self.ignore_value2text_conversions,
+                self.display_cg_name,
+                self.line_interconnect,
+                1,
+                None,
+                None,
+                self,
+            )
+
+        except:
+            raise
+        else:
+            widget.mdf.configure(integer_interpolation=self.integer_interpolation)
+            self.files.addTab(widget, file_name)
+            self.files.setTabToolTip(0, str(file_name))
+            self.files.setCurrentIndex(0)
+            widget.open_new_files.connect(self._open_file)
+            widget.full_screen_toggled.connect(self.toggle_fullscreen)
+
+            self.edit_cursor_options()
+
     def open_file(self, event):
         system = platform.system().lower()
         if system == "linux":
@@ -1336,6 +1375,8 @@ class MainWindow(WithMDIArea, Ui_PyMDFMainWindow, QtWidgets.QMainWindow):
 
         for file_name in natsorted(file_names):
             self._open_file(file_name)
+    def stream(self, event):
+        self._open_stream("Live stream")
 
     def open_folder(self, event):
         folder = QtWidgets.QFileDialog.getExistingDirectory(

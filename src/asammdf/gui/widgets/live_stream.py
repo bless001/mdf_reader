@@ -1,3 +1,5 @@
+import io
+import threading
 from datetime import datetime, timezone
 from functools import partial
 from hashlib import md5
@@ -8,6 +10,7 @@ import re
 from tempfile import gettempdir
 from traceback import format_exc
 from zipfile import ZIP_DEFLATED, ZipFile
+from asammdf import MDF, Signal
 
 from natsort import natsorted
 import pandas as pd
@@ -64,7 +67,11 @@ from .tabular import Tabular
 from .tree import add_children
 from .tree_item import MinimalTreeItem
 from .xy import XY
+from flask import Flask, request
+import sys
 
+app = Flask(__name__)
+DATA_TO_UPDATE = {}
 
 def _process_dict(d):
     new_d = {}
@@ -100,6 +107,10 @@ FRIENDLY_ATRRIBUTES = {
     "pr_display_file": "Default display file",
 }
 
+class DummyPath:
+    def __init__(self, name):
+        self.name = name
+        self.suffix = "mdf"
 
 class Delegate(QtWidgets.QStyledItemDelegate):
     def createEditor(self, parent, option, index):
@@ -114,8 +125,33 @@ class Delegate(QtWidgets.QStyledItemDelegate):
     def setModelData(self, editor, model, index):
         return
 
+class RestartableTimer:
+    def __init__(self, interval, function, *args, **kwargs):
+        self.interval = interval
+        self.function = function
+        self.args = args
+        self.kwargs = kwargs
+        self.timer = None
 
-class FileWidget(WithMDIArea, Ui_file_widget, QtWidgets.QWidget):
+    def _run(self):
+        self.function(*self.args, **self.kwargs)
+        self.timer = None
+
+    def start(self):
+        if self.timer is not None:
+            self.timer.cancel()
+        self.timer = threading.Timer(self.interval, self._run)
+        self.timer.start()
+
+    def restart(self):
+        self.start()
+
+    def cancel(self):
+        if self.timer is not None:
+            self.timer.cancel()
+            self.timer = None
+
+class LiveStreamWidget(WithMDIArea, Ui_file_widget, QtWidgets.QWidget):
     open_new_files = QtCore.Signal(object)
     full_screen_toggled = QtCore.Signal()
     display_file_modified = QtCore.Signal(str)
@@ -135,11 +171,14 @@ class FileWidget(WithMDIArea, Ui_file_widget, QtWidgets.QWidget):
         *args,
         **kwargs,
     ):
+        print(kwargs)
         self.default_folder = kwargs.pop("default_folder", "")
         display_file = kwargs.pop("display_file", "")
         databases = kwargs.pop("databases", None)
         show_progress = kwargs.pop("show_progress", True)
         process_bus_logging = kwargs.pop("process_bus_logging", True)
+        self._update_mdf_timer = RestartableTimer(5, self._update_mdf)
+        self._update_mdf_timer.start()
         mdf = kwargs.pop("mdf", None)
 
         self._progress = None
@@ -156,7 +195,7 @@ class FileWidget(WithMDIArea, Ui_file_widget, QtWidgets.QWidget):
         self.hide_disabled_channels = hide_disabled_channels
         self.display_cg_name = display_cg_name
 
-        file_name = Path(file_name)
+        file_name = DummyPath(file_name)
         self.subplots = subplots
         self.subplots_link = subplots_link
         self.ignore_value2text_conversions = ignore_value2text_conversions
@@ -185,105 +224,114 @@ class FileWidget(WithMDIArea, Ui_file_widget, QtWidgets.QWidget):
             progress.show()
         else:
             progress = None
-
+        #
+        # try:
+        #     if mdf is None:
+        #         if file_name.suffix.lower() in (".asc", ".blf", ".erg", ".bsig", ".dl3", ".tdms"):
+        #             extension = file_name.suffix.lower().strip(".")
+        #             if progress:
+        #                 progress.setLabelText(f"Converting from {extension} to mdf")
+        #
+        #             try:
+        #                 from mfile import ASC, BLF, BSIG, DL3, ERG, TDMS
+        #             except ImportError:
+        #                 from cmerg import BSIG, ERG
+        #
+        #             if file_name.suffix.lower() == ".erg":
+        #                 cls = ERG
+        #             elif file_name.suffix.lower() == ".bsig":
+        #                 cls = BSIG
+        #             elif file_name.suffix.lower() == ".tdms":
+        #                 cls = TDMS
+        #             elif file_name.suffix.lower() == ".asc":
+        #                 cls = ASC
+        #             elif file_name.suffix.lower() == ".blf":
+        #                 cls = BLF
+        #             else:
+        #                 cls = DL3
+        #             print(cls)
+        #
+        #             out_file = Path(gettempdir()) / file_name.name
+        #             if file_name.suffix.lower() in (".asc", ".blf"):
+        #                 meas_file = cls(file_name, databases=databases)
+        #             else:
+        #                 meas_file = cls(file_name)
+        #
+        #             mdf_path = meas_file.export_mdf().save(out_file.with_suffix(".tmp.mf4"))
+        #             meas_file.close()
+        #             self.mdf = mdf_module.MDF(mdf_path, process_bus_logging=process_bus_logging)
+        #             self.mdf.original_name = file_name
+        #             self.mdf.uuid = self.uuid
+        #
+        #         elif file_name.suffix.lower() == ".csv":
+        #             try:
+        #                 with open(file_name) as csv:
+        #                     names = [n.strip() for n in csv.readline().split(",")]
+        #                     units = [n.strip() for n in csv.readline().split(",")]
+        #
+        #                     try:
+        #                         float(units[0])
+        #                     except:
+        #                         units = dict(zip(names, units, strict=False))
+        #                     else:
+        #                         csv.seek(0)
+        #                         csv.readline()
+        #                         units = None
+        #
+        #                     df = pd.read_csv(csv, header=None, names=names)
+        #                     df.set_index(df[names[0]], inplace=True)
+        #                     self.mdf = mdf_module.MDF()
+        #                     self.mdf.append(df, units=units)
+        #                     self.mdf.uuid = self.uuid
+        #                     self.mdf.original_name = file_name
+        #             except Exception as exc:
+        #                 if progress:
+        #                     progress.cancel()
+        #                 print(format_exc())
+        #                 raise Exception(
+        #                     "Could not load CSV. The first line must contain the channel names. The seconds line "
+        #                     "can optionally contain the channel units. The first column must be the time"
+        #                 ) from exc
+        #
+        #         else:
         try:
-            if mdf is None:
-                if file_name.suffix.lower() in (".asc", ".blf", ".erg", ".bsig", ".dl3", ".tdms"):
-                    extension = file_name.suffix.lower().strip(".")
-                    if progress:
-                        progress.setLabelText(f"Converting from {extension} to mdf")
+            original_name = file_name
+            file_name = io.BytesIO()
+            self._file_io = file_name
+            self.file_name.name = "Live stream"
+            mdf = mdf_module.MDF(version='4.10')  # you can also use '4.00' or other supported versions
 
-                    try:
-                        from mfile import ASC, BLF, BSIG, DL3, ERG, TDMS
-                    except ImportError:
-                        from cmerg import BSIG, ERG
+            # Save it to disk
+            mdf.save(file_name)
 
-                    if file_name.suffix.lower() == ".erg":
-                        cls = ERG
-                    elif file_name.suffix.lower() == ".bsig":
-                        cls = BSIG
-                    elif file_name.suffix.lower() == ".tdms":
-                        cls = TDMS
-                    elif file_name.suffix.lower() == ".asc":
-                        cls = ASC
-                    elif file_name.suffix.lower() == ".blf":
-                        cls = BLF
-                    else:
-                        cls = DL3
-                    print(f"{cls=}")
 
-                    out_file = Path(gettempdir()) / file_name.name
-                    if file_name.suffix.lower() in (".asc", ".blf"):
-                        meas_file = cls(file_name, databases=databases)
-                    else:
-                        meas_file = cls(file_name)
+            target = mdf_module.MDF
+            kwargs = {
+                "name": file_name,
+                "callback": self.update_progress,
+                "password": password,
+                "use_display_names": True,
+                "process_bus_logging": process_bus_logging,
+            }
 
-                    mdf_path = meas_file.export_mdf().save(out_file.with_suffix(".tmp.mf4"))
-                    meas_file.close()
-                    self.mdf = mdf_module.MDF(mdf_path, process_bus_logging=process_bus_logging)
-                    self.mdf.original_name = file_name
-                    self.mdf.uuid = self.uuid
+            self.mdf = run_thread_with_progress(
+                self,
+                target=target,
+                kwargs=kwargs,
+                factor=33,
+                offset=0,
+                progress=progress,
+            )
 
-                elif file_name.suffix.lower() == ".csv":
-                    try:
-                        with open(file_name) as csv:
-                            names = [n.strip() for n in csv.readline().split(",")]
-                            units = [n.strip() for n in csv.readline().split(",")]
+            if self.mdf is TERMINATED:
+                return
 
-                            try:
-                                float(units[0])
-                            except:
-                                units = dict(zip(names, units, strict=False))
-                            else:
-                                csv.seek(0)
-                                csv.readline()
-                                units = None
-
-                            df = pd.read_csv(csv, header=None, names=names)
-                            df.set_index(df[names[0]], inplace=True)
-                            self.mdf = mdf_module.MDF()
-                            self.mdf.append(df, units=units)
-                            self.mdf.uuid = self.uuid
-                            self.mdf.original_name = file_name
-                    except Exception as exc:
-                        if progress:
-                            progress.cancel()
-                        print(format_exc())
-                        raise Exception(
-                            "Could not load CSV. The first line must contain the channel names. The seconds line "
-                            "can optionally contain the channel units. The first column must be the time"
-                        ) from exc
-
-                else:
-                    original_name = file_name
-
-                    target = mdf_module.MDF
-                    kwargs = {
-                        "name": file_name,
-                        "callback": self.update_progress,
-                        "password": password,
-                        "use_display_names": True,
-                        "process_bus_logging": process_bus_logging,
-                    }
-
-                    self.mdf = run_thread_with_progress(
-                        self,
-                        target=target,
-                        kwargs=kwargs,
-                        factor=33,
-                        offset=0,
-                        progress=progress,
-                    )
-
-                    if self.mdf is TERMINATED:
-                        return
-
-                    self.mdf.original_name = original_name
-                    self.mdf.uuid = self.uuid
-            else:
-                self.mdf = mdf
-                self.mdf.original_name = file_name
-                self.mdf.uuid = self.uuid
+            self.mdf.original_name = original_name
+            self.mdf.uuid = self.uuid
+            # else:
+            #     self.mdf = mdf
+            #     self.mdf.original_name = file_name
+            #     self.mdf.uuid = self.uuid
 
             self.mdf.configure(raise_on_multiple_occurrences=False)
 
@@ -580,8 +628,51 @@ class FileWidget(WithMDIArea, Ui_file_widget, QtWidgets.QWidget):
                     if default_display_file.exists():
                         self.load_channel_list(file_name=default_display_file, show_progress=False)
 
+        self.flask_thread = threading.Thread(target=self.start_recieving)
+        self.flask_thread.start()
+        print("Starting flask")
+
         self.restore_export_setttings()
         self.connect_export_updates()
+
+    def _update_mdf(self):
+        sigs = []
+        for _sig in DATA_TO_UPDATE:
+            sig = Signal(
+                DATA_TO_UPDATE[_sig][0],
+                DATA_TO_UPDATE[_sig][1],
+                name="Channel_lookup_with_axis",
+                unit="A",
+                comment="Array channel with axis",
+            )
+            sigs.append(sig)
+        with io.BytesIO() as f:
+            mdf_new = mdf_module.MDF(version='4.10')
+            mdf_new.append(sigs, comment="arrays", common_timebase=True)
+        self.mdf.concatenate(mdf_new)
+        # self._file_io.close()
+        # self._update_mdf_timer.cancel()
+        self._update_mdf_timer.restart()
+    @staticmethod
+    @app.route("/data", methods=["POST"])
+    def update_data():
+        data = json.loads(request.data)
+        if data["name"] in DATA_TO_UPDATE:
+            DATA_TO_UPDATE[data["name"]][0].append(data["value"])
+            DATA_TO_UPDATE[data["name"]][1].append(data["time"])
+        else:
+            DATA_TO_UPDATE[data["name"]] = [[data["value"]], [data["time"]]]
+        return {"status": 200}
+
+    def start_recieving(self):
+        app.run(host="127.0.0.1", port=5002)
+
+    def shutdown_server(self):
+        func = request.environ.get('werkzeug.server.shutdown')
+        sys.exit()
+        if func is None:
+            raise RuntimeError('Not running with the Werkzeug Server')
+        func()
 
     def sizeHint(self):
         return QtCore.QSize(1, 1)
@@ -1646,6 +1737,7 @@ MultiRasterSeparator;&
                 iterator += 1
 
     def close(self):
+        self.shutdown_server()
         mdf_name = self.mdf.name
         self.mdf.close()
         if mdf_name != self.mdf.original_name and mdf_name.is_file():
